@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import html
 import io
+import json
 import os
 import re
 import secrets as pysecrets
@@ -72,6 +73,14 @@ DEFAULTS = {
     ),
     "color_fondo": "#FFFFFF",
     "color_principal": "#1D4ED8",
+    "color_texto": "#1F2937",
+    "color_titulos": "#0B1E5B",
+    "color_tarjeta": "#FFFFFF",
+    "color_cuadro1": "",
+    "color_cuadro2": "#050B24",
+    "color_rombos": "#1D4ED8",
+    "logo_flotante": "no",
+    "url_app": "https://clubchesscalamari.streamlit.app",
     "clave_miembros": "",
     "visitas": "0",
     "fotos_iniciales": "no",
@@ -147,12 +156,27 @@ class Datos:
                 codigo_hash TEXT, codigo_exp TEXT, codigo_intentos INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS publicaciones(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, autor TEXT, es_admin INTEGER DEFAULT 0,
-                texto TEXT, imagen TEXT, tiene_foto INTEGER DEFAULT 0, creada TEXT);
+                texto TEXT, imagen TEXT, tiene_foto INTEGER DEFAULT 0, creada TEXT,
+                audio TEXT, tiene_audio INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS reacciones(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, pub_id INTEGER, usuario TEXT, tipo TEXT,
                 UNIQUE(pub_id, usuario));
+            CREATE TABLE IF NOT EXISTS encuestas(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, pregunta TEXT, opciones TEXT,
+                cerrada INTEGER DEFAULT 0, creada TEXT);
+            CREATE TABLE IF NOT EXISTS votos(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, encuesta_id INTEGER, usuario TEXT,
+                opcion INTEGER, UNIQUE(encuesta_id, usuario));
             """
         )
+        for alter in (
+            "ALTER TABLE publicaciones ADD COLUMN audio TEXT",
+            "ALTER TABLE publicaciones ADD COLUMN tiene_audio INTEGER DEFAULT 0",
+        ):
+            try:
+                con.execute(alter)
+            except sqlite3.OperationalError:
+                pass
         return con
 
     # ---------- Ajustes ----------
@@ -395,12 +419,19 @@ class Datos:
     # ---------- Publicaciones del grupo ----------
     def publicaciones(self, limite=20):
         if USA_SUPABASE:
-            return self._rest("GET", "publicaciones", {
-                "select": "id,autor,es_admin,texto,creada,tiene_foto",
-                "order": "id.desc", "limit": limite})
+            base = {"order": "id.desc", "limit": limite}
+            try:
+                return self._rest("GET", "publicaciones", {
+                    "select": "id,autor,es_admin,texto,creada,tiene_foto,tiene_audio", **base})
+            except Exception:  # todavía no existe la columna de audio
+                filas = self._rest("GET", "publicaciones", {
+                    "select": "id,autor,es_admin,texto,creada,tiene_foto", **base})
+                for f in filas:
+                    f["tiene_audio"] = False
+                return filas
         con = self._db()
         filas = [dict(f) for f in con.execute(
-            "SELECT id,autor,es_admin,texto,creada,tiene_foto FROM publicaciones "
+            "SELECT id,autor,es_admin,texto,creada,tiene_foto,tiene_audio FROM publicaciones "
             "ORDER BY id DESC LIMIT ?", (limite,))]
         con.close()
         return filas
@@ -414,19 +445,24 @@ class Datos:
         con.close()
         return (f["imagen"] or "") if f else ""
 
-    def crear_pub(self, autor, es_admin, texto, imagen_b64=None):
+    def crear_pub(self, autor, es_admin, texto, imagen_b64=None, audio_b64=None):
         ahora = datetime.utcnow().isoformat()
         tiene = bool(imagen_b64)
         if USA_SUPABASE:
-            self._rest("POST", "publicaciones", json=[{
+            fila = {
                 "autor": autor, "es_admin": bool(es_admin), "texto": texto,
-                "imagen": imagen_b64, "tiene_foto": tiene, "creada": ahora}])
+                "imagen": imagen_b64, "tiene_foto": tiene, "creada": ahora}
+            if audio_b64:
+                fila["audio"] = audio_b64
+                fila["tiene_audio"] = True
+            self._rest("POST", "publicaciones", json=[fila])
         else:
             con = self._db()
             con.execute(
-                "INSERT INTO publicaciones(autor,es_admin,texto,imagen,tiene_foto,creada) "
-                "VALUES (?,?,?,?,?,?)",
-                (autor, 1 if es_admin else 0, texto, imagen_b64, 1 if tiene else 0, ahora))
+                "INSERT INTO publicaciones(autor,es_admin,texto,imagen,tiene_foto,creada,audio,tiene_audio) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (autor, 1 if es_admin else 0, texto, imagen_b64, 1 if tiene else 0, ahora,
+                 audio_b64, 1 if audio_b64 else 0))
             con.commit()
             con.close()
 
@@ -478,6 +514,99 @@ class Datos:
             con.commit()
             con.close()
 
+    # ---------- Audio de las publicaciones ----------
+    def audio_pub(self, pid):
+        if USA_SUPABASE:
+            f = self._rest("GET", "publicaciones", {"select": "audio", "id": f"eq.{pid}"})
+            return (f[0].get("audio") or "") if f else ""
+        con = self._db()
+        f = con.execute("SELECT audio FROM publicaciones WHERE id=?", (pid,)).fetchone()
+        con.close()
+        return (f["audio"] or "") if f else ""
+
+    # ---------- Encuestas ----------
+    def encuestas(self, limite=10):
+        if USA_SUPABASE:
+            return self._rest("GET", "encuestas", {
+                "select": "*", "order": "id.desc", "limit": limite})
+        con = self._db()
+        filas = [dict(f) for f in con.execute(
+            "SELECT * FROM encuestas ORDER BY id DESC LIMIT ?", (limite,))]
+        con.close()
+        return filas
+
+    def crear_encuesta(self, pregunta, opciones):
+        ahora = datetime.utcnow().isoformat()
+        texto_ops = json.dumps(opciones, ensure_ascii=False)
+        if USA_SUPABASE:
+            self._rest("POST", "encuestas", json=[{
+                "pregunta": pregunta, "opciones": texto_ops, "cerrada": False, "creada": ahora}])
+        else:
+            con = self._db()
+            con.execute(
+                "INSERT INTO encuestas(pregunta,opciones,cerrada,creada) VALUES (?,?,0,?)",
+                (pregunta, texto_ops, ahora))
+            con.commit()
+            con.close()
+
+    def cerrar_encuesta(self, eid, cerrada):
+        if USA_SUPABASE:
+            self._rest("PATCH", "encuestas", {"id": f"eq.{eid}"}, {"cerrada": bool(cerrada)})
+        else:
+            con = self._db()
+            con.execute("UPDATE encuestas SET cerrada=? WHERE id=?", (1 if cerrada else 0, eid))
+            con.commit()
+            con.close()
+
+    def borrar_encuesta(self, eid):
+        if USA_SUPABASE:
+            self._rest("DELETE", "encuestas", {"id": f"eq.{eid}"})
+        else:
+            con = self._db()
+            con.execute("DELETE FROM votos WHERE encuesta_id=?", (eid,))
+            con.execute("DELETE FROM encuestas WHERE id=?", (eid,))
+            con.commit()
+            con.close()
+
+    def votos(self, ids):
+        if not ids:
+            return []
+        if USA_SUPABASE:
+            lista = ",".join(str(int(i)) for i in ids)
+            return self._rest("GET", "votos", {
+                "select": "encuesta_id,usuario,opcion", "encuesta_id": f"in.({lista})"})
+        con = self._db()
+        marcas = ",".join("?" for _ in ids)
+        filas = [dict(f) for f in con.execute(
+            f"SELECT encuesta_id,usuario,opcion FROM votos WHERE encuesta_id IN ({marcas})",
+            list(ids))]
+        con.close()
+        return filas
+
+    def poner_voto(self, eid, usuario, opcion):
+        if USA_SUPABASE:
+            self._rest(
+                "POST", "votos", {"on_conflict": "encuesta_id,usuario"},
+                [{"encuesta_id": eid, "usuario": usuario, "opcion": opcion}],
+                prefer="resolution=merge-duplicates")
+        else:
+            con = self._db()
+            con.execute(
+                "INSERT INTO votos(encuesta_id,usuario,opcion) VALUES (?,?,?) "
+                "ON CONFLICT(encuesta_id,usuario) DO UPDATE SET opcion=excluded.opcion",
+                (eid, usuario, opcion))
+            con.commit()
+            con.close()
+
+    def quitar_voto(self, eid, usuario):
+        if USA_SUPABASE:
+            self._rest("DELETE", "votos", {"encuesta_id": f"eq.{eid}", "usuario": f"eq.{usuario}"})
+        else:
+            con = self._db()
+            con.execute("DELETE FROM votos WHERE encuesta_id=? AND usuario=?", (eid, usuario))
+            con.commit()
+            con.close()
+
 
 DB = Datos()
 
@@ -508,6 +637,11 @@ def cargar_banner_db():
 @st.cache_data(ttl=3600, max_entries=30, show_spinner=False)
 def cargar_img_pub(pid):
     return DB.imagen_pub(pid)
+
+
+@st.cache_data(ttl=3600, max_entries=20, show_spinner=False)
+def cargar_audio_pub(pid):
+    return DB.audio_pub(pid)
 
 
 def limpiar_cache():
@@ -636,6 +770,99 @@ def clave_admin_ok(pw):
     return bool(base) and hmac.compare_digest(pw.encode("utf-8"), base.encode("utf-8"))
 
 
+# ── Colores: ayudas para que las letras siempre se lean ──
+def _rgb(h):
+    try:
+        h = str(h).lstrip("#")
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        return (0, 0, 0)
+
+
+def texto_sobre(h):
+    """Blanco u oscuro, según lo claro que sea el color de fondo."""
+    r, g, b = (c / 255 for c in _rgb(h))
+    return "#FFFFFF" if (0.2126 * r + 0.7152 * g + 0.0722 * b) < 0.55 else "#111827"
+
+
+def rgba(h, a):
+    r, g, b = _rgb(h)
+    return f"rgba({r},{g},{b},{a})"
+
+
+# ── Logo: se pueden cambiar los rombos azules por otro color ──
+AZUL_LOGO = (16, 61, 230)  # azul original de los rombos
+
+
+@st.cache_data(show_spinner=False)
+def logo_b64(color_hex):
+    ruta = os.path.join(IMG, "logo.png")
+    if not os.path.exists(ruta):
+        return ""
+    if str(color_hex).upper() in ("", "#1D4ED8", "#103DE6"):
+        return archivo_b64("logo.png")
+    import numpy as np
+    a = np.asarray(Image.open(ruta).convert("RGB"), dtype=np.float32)
+    mx, mn = a.max(axis=2), a.min(axis=2)
+    crom_ref = AZUL_LOGO[2] - AZUL_LOGO[0]
+    alfa = np.clip((mx - mn) / crom_ref, 0, 1) * (a[..., 2] >= mx - 1)
+    alfa = np.where(alfa < 0.06, 0, alfa)
+    nuevo = np.array(_rgb(color_hex), dtype=np.float32)
+    out = np.clip(a + alfa[..., None] * (nuevo - np.array(AZUL_LOGO, dtype=np.float32)), 0, 255)
+    buf = io.BytesIO()
+    Image.fromarray(out.astype("uint8")).save(buf, "PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+# ── Mensajes de voz: se comprimen (mono, 16 kHz) para que pesen poco ──
+def preparar_audio(archivo, max_seg=60):
+    import wave
+    import numpy as np
+    datos = archivo.getvalue()
+    with wave.open(io.BytesIO(datos), "rb") as w:
+        n, canales, ancho, sr = w.getnframes(), w.getnchannels(), w.getsampwidth(), w.getframerate()
+        if ancho != 2 or sr <= 0:
+            raise ValueError("Formato de audio no compatible.")
+        if n / sr > max_seg + 1:
+            raise ValueError(f"El mensaje de voz puede durar máximo {max_seg} segundos.")
+        crudo = w.readframes(n)
+    x = np.frombuffer(crudo, dtype=np.int16).astype(np.float32)
+    if canales > 1:
+        x = x.reshape(-1, canales).mean(axis=1)
+    if sr > 16000:
+        k = int(round(sr / 16000))
+        if k > 1:
+            x = np.convolve(x, np.ones(k) / k, mode="same")
+        total = max(1, int(len(x) * 16000 / sr))
+        x = np.interp(np.linspace(0, len(x) - 1, total), np.arange(len(x)), x)
+        sr = 16000
+    y = np.clip(x, -32768, 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w2:
+        w2.setnchannels(1)
+        w2.setsampwidth(2)
+        w2.setframerate(sr)
+        w2.writeframes(y.tobytes())
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+TEMA_CLARO = {
+    "color_fondo": "#FFFFFF", "color_texto": "#1F2937", "color_titulos": "#0B1E5B",
+    "color_tarjeta": "#FFFFFF", "color_principal": "#1D4ED8", "color_cuadro1": "#1D4ED8",
+    "color_cuadro2": "#050B24"}
+TEMA_OSCURO = {
+    "color_fondo": "#0F172A", "color_texto": "#E5E7EB", "color_titulos": "#93C5FD",
+    "color_tarjeta": "#1E293B", "color_principal": "#2563EB", "color_cuadro1": "#2563EB",
+    "color_cuadro2": "#020617"}
+
+
+def guardar_colores(datos):
+    for k, v in datos.items():
+        DB.guardar_ajuste(k, v)
+    limpiar_cache()
+    st.rerun()
+
+
 def dias_desde(iso):
     try:
         return (datetime.utcnow() - datetime.fromisoformat(str(iso)[:26])).days
@@ -669,6 +896,7 @@ ss.setdefault("fallos_admin", 0)
 ss.setdefault("fallos_pin", 0)
 ss.setdefault("limite_pubs", 20)
 ss.setdefault("confirmar_del", None)
+ss.setdefault("audio_n", 0)
 ss.setdefault("visita_contada", False)
 
 try:
@@ -692,8 +920,16 @@ if not ss.visita_contada:
     except Exception:
         pass
 
-AZUL = A.get("color_principal", "#1D4ED8")
-FONDO = A.get("color_fondo", "#FFFFFF")
+AZUL = A.get("color_principal") or "#1D4ED8"
+FONDO = A.get("color_fondo") or "#FFFFFF"
+TXT = A.get("color_texto") or "#1F2937"
+TIT = A.get("color_titulos") or "#0B1E5B"
+TARJ = A.get("color_tarjeta") or "#FFFFFF"
+TARJ_A = rgba(TARJ, 0.94)
+C1 = A.get("color_cuadro1") or AZUL
+C2 = A.get("color_cuadro2") or "#050B24"
+SOBRE_C2 = texto_sobre(C2)
+SOBRE_AZ = texto_sobre(AZUL)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -720,50 +956,77 @@ BALCON_SVG = (
 st.markdown(
     f"""
 <style>
-:root {{ --azul: {AZUL}; --azul-osc: #0B1E5B; }}
+:root {{ --azul: {AZUL}; --azul-osc: {TIT}; --texto: {TXT}; --titulos: {TIT}; --tarjeta: {TARJ_A};
+  --c1: {C1}; --c2: {C2}; --sobre-c2: {SOBRE_C2}; --sobre-azul: {SOBRE_AZ}; }}
 .stApp {{ background-color: {FONDO}; {fondo_css} }}
 .block-container {{ padding-top: 0.6rem; max-width: 1150px; }}
 header[data-testid="stHeader"] {{ background: transparent; }}
 
+/* Colores de las letras (los eliges en Admin → Colores e imagen) */
+.stApp p, .stApp li, .stApp label, .stApp [data-testid="stMarkdownContainer"],
+.stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stMetric"] *,
+.stApp [data-testid="stWidgetLabel"] *, .stApp summary, .stApp summary * {{
+  color: var(--texto) !important; }}
+.stApp h1, .stApp h2, .stApp h3, .stApp h4 {{ color: var(--titulos) !important; }}
+.stApp [data-testid="stAlert"] *, .stApp [data-testid="stFileUploaderDropzone"] * {{
+  color: #1F2937 !important; }}
+
 /* Barra superior con tablero en las esquinas */
 .barra {{
-  position: relative; background: #050B24; color: white; border-radius: 10px 10px 0 0;
+  position: relative; background: var(--c2); color: var(--sobre-c2); border-radius: 10px 10px 0 0;
   padding: 10px 150px; text-align: center; font-weight: 700; letter-spacing: 3px;
   font-size: 0.95rem; overflow: hidden; min-height: 44px;
 }}
 .barra::before, .barra::after {{
   content: ""; position: absolute; top: 0; width: 120px; height: 100%;
-  background: repeating-conic-gradient(var(--azul) 0% 25%, #050B24 0% 50%) 0 0 / 30px 30px;
+  background: repeating-conic-gradient(var(--c1) 0% 25%, var(--c2) 0% 50%) 0 0 / 30px 30px;
 }}
 .barra::before {{ left: 0; }} .barra::after {{ right: 0; }}
 @media (max-width: 640px) {{
   .barra {{ padding: 10px 60px; font-size: .7rem; letter-spacing: 1px; }}
   .barra::before, .barra::after {{ width: 45px; background-size: 22px 22px; }}
 }}
-.banner img {{ width: 100%; display: block; border-radius: 0 0 14px 14px;
+.banner {{ position: relative; }}
+.banner .banner-img {{ width: 100%; display: block; border-radius: 0 0 14px 14px;
   border-bottom: 5px solid var(--azul); }}
+/* El escudo con el logo es independiente de la foto: si cambias la foto, el logo se queda */
+.escudo {{ position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 17%;
+  aspect-ratio: 1 / 1.2634; background: #FFFFFF;
+  clip-path: polygon(0 0, 100% 0, 100% 72%, 50% 100%, 0 72%);
+  display: flex; justify-content: center; align-items: flex-start; }}
+.escudo img {{ width: 64%; height: auto; margin-top: 5%; border: 0 !important; border-radius: 0 !important; }}
+.logo-flotante {{ position: fixed; right: 14px; bottom: 14px; z-index: 999; width: 64px; height: 64px;
+  background: #FFFFFF; border-radius: 50%; box-shadow: 0 2px 10px rgba(0,0,0,.35);
+  display: flex; align-items: center; justify-content: center; border: 2px solid var(--azul); }}
+.logo-flotante img {{ height: 80%; width: auto; }}
 .lema {{ text-align: center; font-family: Georgia, serif; font-size: 1.35rem;
-  margin: 14px 0 4px; color: var(--azul-osc); font-weight: 700; }}
+  margin: 14px 0 4px; color: var(--titulos) !important; font-weight: 700; }}
 
 /* Pestañas */
-div[data-baseweb="tab-list"] {{ gap: 4px; justify-content: center; flex-wrap: wrap;
-  background: #050B24; border-radius: 10px; padding: 6px; margin: 10px 0 14px; }}
-button[data-baseweb="tab"] {{ color: #dbe4ff !important; font-weight: 700; border-radius: 8px; }}
-button[data-baseweb="tab"][aria-selected="true"] {{ background: var(--azul); color: white !important; }}
-div[data-baseweb="tab-highlight"] {{ display: none; }}
+.stApp div[role="tablist"] {{ gap: 4px; justify-content: center; flex-wrap: wrap;
+  background: var(--c2); border-radius: 10px; padding: 6px; margin: 10px 0 14px; }}
+.stApp button[role="tab"] {{ font-weight: 700; border-radius: 8px; }}
+.stApp button[role="tab"] p {{ color: var(--sobre-c2) !important; }}
+.stApp button[role="tab"][aria-selected="true"] {{ background: var(--azul); }}
+.stApp button[role="tab"][aria-selected="true"] p {{ color: var(--sobre-azul) !important; }}
+.stApp div[data-baseweb="tab-highlight"], .stApp div[data-baseweb="tab-border"] {{ display: none; }}
 
-/* Tarjetas con borde azul doble */
+/* Tarjetas con borde doble */
 .tarjeta {{
-  background: rgba(255,255,255,.93); border: 3px solid var(--azul); outline: 2px solid var(--azul);
+  background: var(--tarjeta); border: 3px solid var(--azul); outline: 2px solid var(--azul);
   outline-offset: 3px; border-radius: 10px; padding: 16px 20px; margin: 10px 4px 14px;
   box-shadow: 0 4px 14px rgba(0,0,0,.12);
 }}
-.tarjeta h3 {{ margin-top: 0; color: var(--azul-osc); font-family: Georgia, serif; }}
+.tarjeta h3 {{ margin-top: 0; font-family: Georgia, serif; }}
 
 /* Botones */
-.stButton > button, .stFormSubmitButton > button, .stDownloadButton > button {{
-  background: var(--azul); color: white; border: 0; border-radius: 8px; font-weight: 700; }}
-.stButton > button:hover, .stFormSubmitButton > button:hover {{ background: var(--azul-osc); color: white; }}
+.stButton > button, .stFormSubmitButton > button, .stDownloadButton > button,
+.stApp a[data-testid^="stBaseLinkButton"] {{
+  background: var(--azul); border: 0; border-radius: 8px; font-weight: 700; }}
+.stApp .stButton > button p, .stApp .stFormSubmitButton > button p,
+.stApp .stDownloadButton > button p, .stApp a[data-testid^="stBaseLinkButton"] p {{
+  color: var(--sobre-azul) !important; }}
+.stButton > button:hover, .stFormSubmitButton > button:hover {{ filter: brightness(.88); }}
 
 /* Carrusel: flechas sobre la imagen */
 .st-key-carrusel {{ position: relative; max-width: 760px; margin: 0 auto; }}
@@ -775,20 +1038,21 @@ div[data-baseweb="tab-highlight"] {{ display: none; }}
   border-radius: 50% !important; width: 46px; height: 46px; font-size: 1.3rem; padding: 0;
   border: 2px solid white !important; box-shadow: 0 2px 8px rgba(0,0,0,.4); }}
 .texto-foto {{ text-align: center; font-size: 1.2rem; font-weight: 600; margin: 4px 0 10px;
-  color: var(--azul-osc); background: rgba(255,255,255,.85); border-radius: 8px; padding: 8px; }}
+  color: var(--titulos) !important; background: var(--tarjeta); border-radius: 8px; padding: 8px; }}
 
-/* Reacciones del grupo siempre en una fila (también en celular) */
+/* Filas de botones del grupo (reacciones, votos) siempre en una fila, también en celular */
 [class*="st-key-r_"] [data-testid="stHorizontalBlock"] {{
   flex-direction: row !important; flex-wrap: nowrap !important; gap: .4rem; }}
 [class*="st-key-r_"] [data-testid="stColumn"], [class*="st-key-r_"] [data-testid="column"] {{
   min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }}
 
 /* Pie con balcones */
-.pie {{ background: #050B24; border-radius: 12px; padding: 14px; margin-top: 24px;
-  display: flex; align-items: center; justify-content: center; gap: 18px; flex-wrap: wrap; color: #dbe4ff; }}
+.pie {{ background: var(--c2); border-radius: 12px; padding: 14px; margin-top: 24px;
+  display: flex; align-items: center; justify-content: center; gap: 18px; flex-wrap: wrap;
+  color: var(--sobre-c2) !important; }}
 .pie .balcon {{ width: 54px; }}
-.pie .info {{ text-align: center; font-size: .9rem; line-height: 1.6; }}
-.pie a {{ color: #9db8ff; }}
+.pie .info {{ text-align: center; font-size: .9rem; line-height: 1.6; color: var(--sobre-c2) !important; }}
+.pie a {{ color: var(--sobre-c2) !important; text-decoration: underline; }}
 </style>
 """,
     unsafe_allow_html=True,
@@ -803,9 +1067,21 @@ try:
 except Exception:
     banner = archivo_b64("banner.jpg")
 st.markdown('<div class="barra">AJEDREZ · CARTAGENA · CLUB CHESS CALAMARI</div>', unsafe_allow_html=True)
+try:
+    logo_actual = logo_b64(A.get("color_rombos") or DEFAULTS["color_rombos"])
+except Exception:
+    logo_actual = archivo_b64("logo.png")
+escudo = (
+    f'<div class="escudo"><img src="data:image/png;base64,{logo_actual}" alt="Club Chess Calamari"></div>'
+    if logo_actual else "")
 if banner:
     st.markdown(
-        f'<div class="banner"><img src="data:image/jpeg;base64,{banner}" alt="Club Chess Calamari"></div>',
+        f'<div class="banner"><img class="banner-img" src="data:image/jpeg;base64,{banner}" alt="">{escudo}</div>',
+        unsafe_allow_html=True,
+    )
+if A.get("logo_flotante") == "si" and logo_actual:
+    st.markdown(
+        f'<div class="logo-flotante"><img src="data:image/png;base64,{logo_actual}" alt="Logo"></div>',
         unsafe_allow_html=True,
     )
 st.markdown(f'<div class="lema">♟️ {esc(A["lema"])} ♟️</div>', unsafe_allow_html=True)
@@ -899,7 +1175,7 @@ def mostrar_carrusel():
 # ──────────────────────────────────────────────────────────────
 # ZONA DE MIEMBROS (inscripción, inicio de sesión y grupo)
 # ──────────────────────────────────────────────────────────────
-NOMBRE_ADMIN = "👑 Administradora"
+NOMBRE_ADMIN = "Administradora"
 MSG_ESPERA = (
     "✅ ¡Solicitud enviada! Espera hasta 5 días a que el administrador autorice tu admisión. "
     "Cuando te acepten, podrás iniciar sesión con tu usuario y contraseña."
@@ -1012,6 +1288,8 @@ def vista_inscribir():
     correo = correo.strip().lower()
     if not re.fullmatch(r"[a-z0-9_]{4,20}", u):
         st.error("El usuario debe tener de 4 a 20 caracteres: letras minúsculas, números o _.")
+    elif u.startswith("admin") or u in ("club", "calamari"):
+        st.error("Ese nombre de usuario no está disponible. Elige otro.")
     elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", correo):
         st.error("Escribe un correo válido.")
     elif validar_clave(p1):
@@ -1150,6 +1428,104 @@ def cambiar_clave_miembro(usuario):
                 st.success("Contraseña actualizada.")
 
 
+def nombre_vis(x):
+    """Nombre sin coronitas (por si hay publicaciones antiguas con corona)."""
+    return str(x or "").replace("👑", "").strip()
+
+
+def votar(eid, usuario, opcion, actual):
+    try:
+        if actual == opcion:
+            DB.quitar_voto(eid, usuario)
+        else:
+            DB.poner_voto(eid, usuario, opcion)
+    except Exception:
+        st.toast("No se pudo guardar tu voto.")
+
+
+def cambiar_encuesta(eid, cerrada):
+    try:
+        DB.cerrar_encuesta(eid, cerrada)
+    except Exception:
+        st.toast("No se pudo cambiar la encuesta.")
+
+
+def borrar_encuesta_cb(eid):
+    try:
+        DB.borrar_encuesta(eid)
+    except Exception:
+        st.toast("No se pudo borrar la encuesta.")
+
+
+def mostrar_encuestas(yo, soy_admin):
+    try:
+        encs = DB.encuestas(10)
+        votos = DB.votos([e["id"] for e in encs])
+    except Exception:
+        if soy_admin:
+            st.warning(
+                "Para usar encuestas y mensajes de voz falta ejecutar el SQL nuevo en Supabase "
+                "(archivo supabase_actualizacion2.sql).")
+        return
+    st.markdown("#### 📊 Encuestas")
+    if soy_admin:
+        with st.expander("➕ Crear una encuesta"):
+            with st.form("f_enc", clear_on_submit=True):
+                preg = st.text_input("Pregunta", max_chars=200)
+                ops = st.text_area("Opciones (una por línea, de 2 a 6)", height=120)
+                crear = st.form_submit_button("Publicar encuesta")
+            if crear:
+                lista = [o.strip() for o in ops.splitlines() if o.strip()]
+                if not preg.strip():
+                    st.warning("Escribe la pregunta.")
+                elif not 2 <= len(lista) <= 6:
+                    st.warning("Escribe entre 2 y 6 opciones, una por línea.")
+                else:
+                    try:
+                        DB.crear_encuesta(preg.strip(), [o[:80] for o in lista])
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo crear: {e}")
+    if not encs:
+        st.caption("No hay encuestas por ahora.")
+    yo_n = nombre_vis(yo)
+    for e in encs:
+        try:
+            opciones = json.loads(e["opciones"])
+        except Exception:
+            continue
+        v_e = [v for v in votos if v["encuesta_id"] == e["id"]]
+        total = len(v_e)
+        mi = next((v["opcion"] for v in v_e if nombre_vis(v["usuario"]) == yo_n), None)
+        cerrada = bool(e.get("cerrada"))
+        with st.container(border=True):
+            st.markdown(f"**{esc(e['pregunta'])}**" + ("  · 🔒 cerrada" if cerrada else ""))
+            for i, op in enumerate(opciones):
+                n = sum(1 for v in v_e if v["opcion"] == i)
+                with st.container(key=f"r_v{e['id']}_{i}"):
+                    c1, c2 = st.columns([3, 2])
+                    c1.button(
+                        ("✅ " if mi == i else "") + op, key=f"vt_{e['id']}_{i}",
+                        on_click=votar, args=(e["id"], yo, i, mi), disabled=cerrada,
+                        use_container_width=True)
+                    c2.progress(n / total if total else 0.0, text=f"{n} · {int(100 * n / total) if total else 0}%")
+            st.caption(f"{total} voto(s). Toca tu opción otra vez para quitar tu voto.")
+            if total:
+                with st.expander("Ver quién votó"):
+                    for i, op in enumerate(opciones):
+                        quienes = sorted(nombre_vis(v["usuario"]) for v in v_e if v["opcion"] == i)
+                        if quienes:
+                            st.markdown(f"**{esc(op)}:** " + esc(", ".join(quienes)))
+            if soy_admin:
+                a1, a2 = st.columns(2)
+                a1.button(
+                    "🔓 Abrir" if cerrada else "🔒 Cerrar", key=f"ce_{e['id']}",
+                    on_click=cambiar_encuesta, args=(e["id"], not cerrada), use_container_width=True)
+                a2.button(
+                    "🗑️ Borrar", key=f"be_{e['id']}", on_click=borrar_encuesta_cb,
+                    args=(e["id"],), use_container_width=True)
+
+
 def mostrar_grupo(yo, soy_admin):
     if ss.socio:
         a, b = st.columns([3, 1])
@@ -1159,7 +1535,7 @@ def mostrar_grupo(yo, soy_admin):
             st.rerun()
         cambiar_clave_miembro(ss.socio)
     else:
-        st.success("Estás viendo el grupo como administradora 👑 (puedes borrar publicaciones).")
+        st.success("Estás viendo el grupo como administradora: puedes borrar publicaciones y crear encuestas.")
 
     # Avisos importantes (los publica la administradora desde Admin → Avisos)
     try:
@@ -1171,6 +1547,8 @@ def mostrar_grupo(yo, soy_admin):
                 unsafe_allow_html=True)
     except Exception:
         pass
+
+    mostrar_encuestas(yo, soy_admin)
 
     st.markdown("#### 💬 Conversación del grupo")
     with st.form("f_pub", clear_on_submit=True):
@@ -1188,6 +1566,24 @@ def mostrar_grupo(yo, soy_admin):
             except Exception as e:
                 st.error(f"No se pudo publicar: {e}")
 
+    if hasattr(st, "audio_input"):
+        with st.expander("🎤 Enviar un mensaje de voz"):
+            st.caption(
+                "Graba hasta 60 segundos. Si ves la página dentro de Google Sites, el micrófono puede "
+                "no funcionar: usa el botón «Abrir en pantalla completa» de arriba.")
+            audio = st.audio_input("Graba tu mensaje", key=f"aud_{ss.audio_n}")
+            if audio is not None and st.button("Enviar mensaje de voz", key="b_env_voz"):
+                try:
+                    DB.crear_pub(yo, soy_admin, "🎤 Mensaje de voz", None, preparar_audio(audio))
+                    ss.audio_n += 1
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(
+                        "No se pudo enviar el mensaje de voz. ¿Ya ejecutaste el SQL nuevo "
+                        f"(supabase_actualizacion2.sql)? Detalle: {e}")
+
     if st.button("🔄 Actualizar conversación", key="b_act"):
         st.rerun()
     try:
@@ -1198,20 +1594,25 @@ def mostrar_grupo(yo, soy_admin):
         return
     if not pubs:
         st.info("Todavía no hay publicaciones. ¡Escribe la primera! ✨")
+    yo_n = nombre_vis(yo)
     for p in pubs:
         de_esta = [r for r in reacs if r["pub_id"] == p["id"]]
-        n_like = sum(1 for r in de_esta if r["tipo"] == "like")
-        n_dis = sum(1 for r in de_esta if r["tipo"] == "dislike")
-        mia = next((r["tipo"] for r in de_esta if r["usuario"] == yo), None)
+        likes = sorted(nombre_vis(r["usuario"]) for r in de_esta if r["tipo"] == "like")
+        dislikes = sorted(nombre_vis(r["usuario"]) for r in de_esta if r["tipo"] == "dislike")
+        mia = next((r["tipo"] for r in de_esta if nombre_vis(r["usuario"]) == yo_n), None)
         with st.container(border=True):
-            marca = "👑 " if p.get("es_admin") else ""
             st.markdown(
-                f"**{marca}{esc(p['autor'])}** · <small>{fecha_bonita(p.get('creada'))}</small>",
+                f"**{esc(nombre_vis(p['autor']))}** · <small>{fecha_bonita(p.get('creada'))}</small>",
                 unsafe_allow_html=True)
             if p.get("texto"):
                 st.markdown(
                     f'<div style="white-space:pre-wrap">{esc(p["texto"])}</div>',
                     unsafe_allow_html=True)
+            if p.get("tiene_audio"):
+                try:
+                    st.audio(base64.b64decode(cargar_audio_pub(p["id"])), format="audio/wav")
+                except Exception:
+                    st.caption("(no se pudo cargar el audio)")
             if p.get("tiene_foto"):
                 try:
                     st.image(base64.b64decode(cargar_img_pub(p["id"])), use_container_width=True)
@@ -1220,23 +1621,30 @@ def mostrar_grupo(yo, soy_admin):
             with st.container(key=f"r_{p['id']}"):
                 c1, c2, c3 = st.columns(3)
                 c1.button(
-                    f"👍 {n_like}", key=f"lk_{p['id']}", on_click=reaccionar,
+                    f"👍 {len(likes)}", key=f"lk_{p['id']}", on_click=reaccionar,
                     args=(p["id"], yo, "like", mia),
                     type="primary" if mia == "like" else "secondary", use_container_width=True)
                 c2.button(
-                    f"👎 {n_dis}", key=f"dl_{p['id']}", on_click=reaccionar,
+                    f"👎 {len(dislikes)}", key=f"dl_{p['id']}", on_click=reaccionar,
                     args=(p["id"], yo, "dislike", mia),
                     type="primary" if mia == "dislike" else "secondary", use_container_width=True)
-                if soy_admin or (p["autor"] == yo and not p.get("es_admin")):
+                if soy_admin or (nombre_vis(p["autor"]) == yo_n and not p.get("es_admin")):
                     c3.button(
                         "🗑️", key=f"dp_{p['id']}", on_click=borrar_publicacion,
                         args=(p["id"],), use_container_width=True)
+            if likes or dislikes:
+                with st.expander("Ver quién reaccionó"):
+                    if likes:
+                        st.markdown("👍 " + esc(", ".join(likes)))
+                    if dislikes:
+                        st.markdown("👎 " + esc(", ".join(dislikes)))
     if len(pubs) >= ss.limite_pubs:
         st.button("Ver publicaciones anteriores", key="b_mas", on_click=mas_publicaciones)
 
 
 def zona_miembros():
     st.markdown("### 🔒 Zona de miembros")
+    st.link_button("🔗 Abrir en pantalla completa", A.get("url_app") or DEFAULTS["url_app"])
     if ss.admin_ok:
         mostrar_grupo(NOMBRE_ADMIN, True)
         return
@@ -1612,6 +2020,8 @@ with t_admin:
                 direccion = st.text_area("Dirección", A["direccion"], height=80)
                 referencia = st.text_input("Referencia", A["referencia"])
                 maps_link = st.text_input("Enlace de Google Maps", A["maps_link"])
+                url_app = st.text_input(
+                    "Enlace directo de esta página (para el botón «pantalla completa»)", A["url_app"])
                 st.markdown("#### 📝 Textos de la página")
                 fundadora = st.text_input("Fundadora", A["fundadora"])
                 lema = st.text_input("Frase principal", A["lema"])
@@ -1622,7 +2032,7 @@ with t_admin:
                 try:
                     for k, v in {
                         "correo": correo, "instagram": instagram, "telefono": telefono, "whatsapp": whatsapp,
-                        "direccion": direccion, "referencia": referencia, "maps_link": maps_link,
+                        "direccion": direccion, "referencia": referencia, "maps_link": maps_link, "url_app": url_app,
                         "fundadora": fundadora, "lema": lema, "bienvenida": bienvenida,
                         "clases": clases,
                     }.items():
@@ -1654,20 +2064,36 @@ with t_admin:
                 st.rerun()
             st.divider()
             st.markdown("#### 🎨 Colores")
+            st.caption(
+                "Si pones un fondo oscuro, elige letras claras y cambia también el fondo de las "
+                "tarjetas. O usa un tema listo:")
+            t1, t2 = st.columns(2)
+            if t1.button("☀️ Tema claro (original)"):
+                guardar_colores({**TEMA_CLARO, "color_rombos": "#1D4ED8", "logo_flotante": "no"})
+            if t2.button("🌙 Tema oscuro"):
+                guardar_colores(TEMA_OSCURO)
             c1, c2 = st.columns(2)
-            nuevo_fondo = c1.color_picker("🎨 Color de fondo de la página", A["color_fondo"])
-            nuevo_azul = c2.color_picker("🔷 Color principal (botones, bordes)", A["color_principal"])
-            st.caption("El dibujo de piezas de ajedrez de fondo se mezcla con el color que elijas.")
+            nuevo_fondo = c1.color_picker("Fondo de la página", A["color_fondo"])
+            nuevo_texto = c2.color_picker("Color de las letras", A["color_texto"])
+            nuevo_tit = c1.color_picker("Color de los títulos", A["color_titulos"])
+            nuevo_tarj = c2.color_picker("Fondo de las tarjetas", A["color_tarjeta"])
+            nuevo_azul = c1.color_picker("Color principal (botones y bordes)", A["color_principal"])
+            nuevo_c1 = c2.color_picker(
+                "Cuadritos de arriba: color 1", A.get("color_cuadro1") or A["color_principal"])
+            nuevo_c2 = c1.color_picker(
+                "Cuadritos de arriba: color 2 (también la barra y el pie)", A["color_cuadro2"])
+            nuevo_rombos = c2.color_picker("Rombos del logo", A["color_rombos"])
+            flota = st.checkbox(
+                "Mostrar el logo fijo en una esquina mientras se baja la página",
+                value=A.get("logo_flotante") == "si")
             if st.button("💾 Guardar colores"):
-                DB.guardar_ajuste("color_fondo", nuevo_fondo)
-                DB.guardar_ajuste("color_principal", nuevo_azul)
-                limpiar_cache()
-                st.rerun()
+                guardar_colores({
+                    "color_fondo": nuevo_fondo, "color_texto": nuevo_texto, "color_titulos": nuevo_tit,
+                    "color_tarjeta": nuevo_tarj, "color_principal": nuevo_azul,
+                    "color_cuadro1": nuevo_c1, "color_cuadro2": nuevo_c2,
+                    "color_rombos": nuevo_rombos, "logo_flotante": "si" if flota else "no"})
             if st.button("↩️ Volver a los colores originales"):
-                DB.guardar_ajuste("color_fondo", DEFAULTS["color_fondo"])
-                DB.guardar_ajuste("color_principal", DEFAULTS["color_principal"])
-                limpiar_cache()
-                st.rerun()
+                guardar_colores({**TEMA_CLARO, "color_rombos": "#1D4ED8", "logo_flotante": "no"})
 
         st.divider()
         if st.button("Cerrar sesión de administrador"):
@@ -1678,6 +2104,7 @@ with t_admin:
 # ──────────────────────────────────────────────────────────────
 # PIE DE PÁGINA
 # ──────────────────────────────────────────────────────────────
+BALCON_SVG = BALCON_SVG.replace("#1D4ED8", C1)
 st.markdown(
     f"""
 <div class="pie">
