@@ -81,6 +81,7 @@ DEFAULTS = {
     "color_rombos": "#1D4ED8",
     "logo_flotante": "no",
     "url_app": "https://clubchesscalamari.streamlit.app",
+    "noticias": "[]",
     "clave_miembros": "",
     "visitas": "0",
     "fotos_iniciales": "no",
@@ -874,6 +875,13 @@ def esc(t):
     return html.escape(str(t or ""))
 
 
+def linkificar(texto_html):
+    """Vuelve clicables los enlaces (https://...) escritos en un texto ya escapado."""
+    return re.sub(
+        r'(https?://[^\s<]+)',
+        r'<a href="\1" target="_blank" rel="noopener noreferrer">\1</a>', texto_html)
+
+
 def fecha_bonita(iso):
     try:
         return datetime.fromisoformat(str(iso)[:19]).strftime("%d/%m/%Y %H:%M")
@@ -1045,6 +1053,10 @@ header[data-testid="stHeader"] {{ background: transparent; }}
   flex-direction: row !important; flex-wrap: nowrap !important; gap: .4rem; }}
 [class*="st-key-r_"] [data-testid="stColumn"], [class*="st-key-r_"] [data-testid="column"] {{
   min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }}
+
+/* Botón de enlace dentro de las tarjetas (noticias) */
+.btn-link {{ display: inline-block; background: var(--azul); color: var(--sobre-azul) !important;
+  padding: 8px 16px; border-radius: 8px; font-weight: 700; text-decoration: none !important; margin-top: 6px; }}
 
 /* Pie con balcones */
 .pie {{ background: var(--c2); border-radius: 12px; padding: 14px; margin-top: 24px;
@@ -1667,10 +1679,25 @@ def zona_miembros():
 with t_inicio:
     st.markdown(
         f'<div class="tarjeta"><h3>♟️ Club Chess Calamari</h3>'
-        f'<p style="white-space:pre-line">{esc(A["bienvenida"])}</p>'
+        f'<p style="white-space:pre-line">{linkificar(esc(A["bienvenida"]))}</p>'
         f'<p>👩‍🏫 <b>Fundadora:</b> {esc(A["fundadora"])}</p></div>',
         unsafe_allow_html=True,
     )
+    try:
+        noticias = json.loads(A.get("noticias") or "[]")
+    except Exception:
+        noticias = []
+    noticias = [n for n in noticias if str(n.get("url", "")).startswith(("http://", "https://"))]
+    if noticias:
+        st.markdown("### 📰 El club en las noticias")
+    for n in noticias:
+        fuente = f'<small>{esc(n.get("fuente"))}</small><br>' if n.get("fuente") else ""
+        desc = f'<p>{esc(n.get("descripcion"))}</p>' if n.get("descripcion") else ""
+        st.markdown(
+            f'<div class="tarjeta"><h3>{esc(n.get("titulo") or "Noticia")}</h3>{fuente}{desc}'
+            f'<a class="btn-link" href="{esc(n["url"])}" target="_blank" rel="noopener noreferrer">'
+            'Leer la noticia ↗</a></div>',
+            unsafe_allow_html=True)
     st.markdown("### 📸 Momentos del club")
     mostrar_carrusel()
 
@@ -1681,7 +1708,7 @@ with t_inicio:
 with t_clases:
     st.markdown(
         f'<div class="tarjeta"><h3>📚 Clases y precios</h3>'
-        f'<p style="white-space:pre-line">{esc(A["clases"])}</p></div>',
+        f'<p style="white-space:pre-line">{linkificar(esc(A["clases"]))}</p></div>',
         unsafe_allow_html=True,
     )
 
@@ -1792,8 +1819,8 @@ with t_admin:
         m4.metric("✉️ Sin leer", sin_leer)
         m5.metric("⏳ Por aprobar", n_pend)
 
-        p_msg, p_miem, p_fotos, p_avisos, p_datos, p_colores, p_cuenta = st.tabs(
-            ["✉️ Mensajes", "👥 Miembros", "📸 Fotos", "📢 Avisos", "📝 Datos y textos",
+        p_msg, p_miem, p_fotos, p_noti, p_avisos, p_datos, p_colores, p_cuenta = st.tabs(
+            ["✉️ Mensajes", "👥 Miembros", "📸 Fotos", "📰 Noticias", "📢 Avisos", "📝 Datos y textos",
              "🎨 Colores e imagen", "🔐 Mi cuenta"]
         )
 
@@ -1882,6 +1909,42 @@ with t_admin:
                         if r2.button("🗑️ Borrar registro", key=f"rb_{m['id']}"):
                             DB.borrar_miembro(m["usuario"])
                             st.rerun()
+
+        # --- Noticias (enlaces a notas de prensa sobre el club)
+        with p_noti:
+            st.markdown("#### 📰 Noticias del club")
+            st.caption(
+                "Pega el enlace de una noticia sobre el club. Aparece en Inicio con un botón "
+                "«Leer la noticia». Solo se muestra tu título y el enlace, no el texto de la nota.")
+            try:
+                lista_n = json.loads(A.get("noticias") or "[]")
+            except Exception:
+                lista_n = []
+            with st.form("f_noti", clear_on_submit=True):
+                n_tit = st.text_input("Título", max_chars=150)
+                n_url = st.text_input("Enlace (empieza con https://)")
+                n_fuente = st.text_input("Medio (ej: Primer Tiempo)", max_chars=60)
+                n_desc = st.text_area("Descripción corta (opcional)", height=80, max_chars=300)
+                n_ok = st.form_submit_button("Agregar noticia")
+            if n_ok:
+                if not n_tit.strip() or not n_url.strip().startswith(("http://", "https://")):
+                    st.warning("Escribe un título y un enlace que empiece con https://")
+                else:
+                    lista_n.insert(0, {
+                        "titulo": n_tit.strip(), "url": n_url.strip(),
+                        "fuente": n_fuente.strip(), "descripcion": n_desc.strip()})
+                    DB.guardar_ajuste("noticias", json.dumps(lista_n, ensure_ascii=False))
+                    limpiar_cache()
+                    st.rerun()
+            for i, n in enumerate(lista_n):
+                with st.container(border=True):
+                    st.write(f"**{n.get('titulo', '')}** · {n.get('fuente', '')}")
+                    st.caption(n.get("url", ""))
+                    if st.button("🗑️ Quitar noticia", key=f"qn_{i}"):
+                        lista_n.pop(i)
+                        DB.guardar_ajuste("noticias", json.dumps(lista_n, ensure_ascii=False))
+                        limpiar_cache()
+                        st.rerun()
 
         # --- Mi cuenta (cambiar contraseña de administradora con PIN)
         with p_cuenta:
